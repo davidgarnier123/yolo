@@ -111,7 +111,11 @@ function App() {
         }
       }
     } catch (err) {
-      addLog(`Erreur Caméra: ${err.message}`, 'error');
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        addLog('ACCÈS CAMÉRA REFUSÉ ! Veuillez autoriser la caméra dans les réglages de votre navigateur.', 'error');
+      } else {
+        addLog(`Erreur Caméra: ${err.message}`, 'error');
+      }
       setStatus('Err: ' + err.message);
     }
   };
@@ -142,12 +146,12 @@ function App() {
         ctx.drawImage(video, 0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
 
         const imageData = ctx.getImageData(0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
-        const tensor = imageDataToTensor(imageData);
+        const floatData = imageDataToTensor(imageData);
 
         workerRef.current.postMessage({
           type: 'FRAME',
           payload: {
-            tensor,
+            floatData,
             originalWidth: video.videoWidth,
             originalHeight: video.videoHeight,
             threshold // Dynamic threshold
@@ -179,7 +183,7 @@ function App() {
     inputData.set(green, YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
     inputData.set(blue, 2 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
 
-    return new ort.Tensor('float32', inputData, [1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE]);
+    return inputData;
   };
 
   const handleDetections = async (payload) => {

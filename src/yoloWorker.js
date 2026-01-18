@@ -15,7 +15,9 @@ self.onmessage = async (e) => {
     if (type === 'LOAD_MODEL') {
         try {
             log('Chargement du moteur ONNX...');
-            ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+            // Use the EXACT same version as in package.json
+            ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
+            ort.env.wasm.numThreads = 1; // Stabilize in workers
 
             session = await ort.InferenceSession.create(payload.modelUrl, {
                 executionProviders: ['wasm'],
@@ -32,7 +34,10 @@ self.onmessage = async (e) => {
     if (type === 'FRAME') {
         if (!session) return;
         try {
-            const { tensor, originalWidth, originalHeight, threshold = 0.25 } = payload;
+            const { floatData, originalWidth, originalHeight, threshold = 0.25 } = payload;
+
+            // Reconstruct tensor here to avoid serialization issues
+            const tensor = new ort.Tensor('float32', floatData, [1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE]);
             const feeds = { [session.inputNames[0]]: tensor };
             const results = await session.run(feeds);
 
