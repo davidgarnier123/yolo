@@ -10,14 +10,24 @@ function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const workerRef = useRef(null);
+  const [results, setResults] = useState([]);
+  const [status, setStatus] = useState('Initialisation...');
+  const [isReady, setIsReady] = useState(false);
+  const [devices, setDevices] = useState([]);
+  const [currentDeviceId, setCurrentDeviceId] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
   const [threshold, setThreshold] = useState(0.25);
-  const [scanSpeed, setScanSpeed] = useState(150); // ms between frames
+  const [scanSpeed, setScanSpeed] = useState(150);
   const [logs, setLogs] = useState([{ msg: 'Initialisation du système...', type: 'info' }]);
   const [showPopup, setShowPopup] = useState(false);
 
   const addLog = (msg, type = 'info') => {
     setLogs(prev => [{ msg, type, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 15));
   };
+
+  // ZXing Reader for localized decoding
+  const zxingReader = useRef(null);
+  const lastScannedCode = useRef({ code: '', time: 0 });
 
   useEffect(() => {
     addLog('Démarrage de l\'application');
