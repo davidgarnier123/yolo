@@ -1,54 +1,52 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { BarcodeDetectorPolyfill as BarcodeDetector } from '@undecaf/barcode-detector-polyfill';
-import { Camera, RefreshCw, AlertCircle } from 'lucide-react';
+import { Camera, Settings, History, Info, Check, RefreshCw, Zap } from 'lucide-react';
+import confetti from 'canvas-confetti';
 
 export default function App() {
   const videoRef = useRef(null);
-  const [result, setResult] = useState('Prêt pour scan');
+  const canvasRef = useRef(null);
+  const [results, setResults] = useState([]);
   const [logs, setLogs] = useState([]);
   const [devices, setDevices] = useState([]);
   const [activeDeviceId, setActiveDeviceId] = useState('');
-  const [isInitializing, setIsInitializing] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [status, setStatus] = useState('Prêt');
+  const [scanSpeed, setScanSpeed] = useState(150);
+  const [showPopup, setShowPopup] = useState(false);
+  const lastScannedCode = useRef({ code: '', time: 0 });
 
-  const addLog = (msg) => setLogs(p => [`${new Date().toLocaleTimeString()}: ${msg}`, ...p].slice(0, 10));
+  const addLog = (msg, type = 'info') => {
+    setLogs(p => [{ msg, type, time: new Date().toLocaleTimeString() }, ...p].slice(0, 15));
+  };
 
   const initCamera = async (specificId = '') => {
-    if (isInitializing) return;
-    setIsInitializing(true);
-    addLog("Initialisation caméra...");
-
     try {
-      // 1. Demander une permission générique pour débloquer les labels
       if (videoRef.current?.srcObject) {
         videoRef.current.srcObject.getTracks().forEach(t => t.stop());
       }
 
-      const constraints = specificId
-        ? { video: { deviceId: { exact: specificId }, width: { ideal: 1280 }, height: { ideal: 720 } } }
-        : { video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } };
+      const constraints = {
+        video: {
+          deviceId: specificId ? { exact: specificId } : undefined,
+          facingMode: specificId ? undefined : 'environment',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      if (videoRef.current) videoRef.current.srcObject = stream;
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-      }
-
-      // 2. Énumérer les appareils maintenant que la permission est acquise
-      const allDevices = await navigator.mediaDevices.enumerateDevices();
-      const videoDevs = allDevices.filter(d => d.kind === 'videoinput');
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const videoDevs = devs.filter(d => d.kind === 'videoinput');
       setDevices(videoDevs);
 
-      // Trouver l'ID actif réel
-      const activeTrack = stream.getVideoTracks()[0];
-      const settings = activeTrack.getSettings();
+      const settings = stream.getVideoTracks()[0].getSettings();
       setActiveDeviceId(settings.deviceId);
-
-      addLog(`Caméra OK: ${settings.width}x${settings.height}`);
+      addLog(`Caméra OK: ${settings.width}x${settings.height}`, 'success');
     } catch (e) {
-      addLog("ERREUR: " + e.message);
-      console.error(e);
-    } finally {
-      setIsInitializing(false);
+      addLog(`Erreur: ${e.message}`, 'error');
     }
   };
 
@@ -62,86 +60,165 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const detector = new BarcodeDetector();
+    // Explicit formats help the engine focus and handle rotation better
+    const detector = new BarcodeDetector({
+      formats: ['code_128', 'qr_code', 'ean_13', 'code_39', 'itf', 'data_matrix']
+    });
     let frameId;
 
     const detect = async () => {
-      if (videoRef.current && videoRef.current.readyState >= 2) {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      if (video && video.readyState >= 2 && canvas) {
         try {
-          const barcodes = await detector.detect(videoRef.current);
+          const barcodes = await detector.detect(video);
+
+          // Draw feedback
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          const ctx = canvas.getContext('2d');
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
           if (barcodes.length > 0) {
-            const code = barcodes[0].rawValue;
-            setResult(code);
-            addLog("SCOPÉ: " + code);
-            if (navigator.vibrate) navigator.vibrate(100);
+            barcodes.forEach(barcode => {
+              drawBarcodeOverlay(ctx, barcode);
+              handleSuccess(barcode.rawValue);
+            });
           }
         } catch (e) {
-          // Detection fail (no barcode in frame)
+          // Detection fail (no barcode)
         }
       }
-      frameId = setTimeout(() => requestAnimationFrame(detect), 200);
+      frameId = setTimeout(() => requestAnimationFrame(detect), scanSpeed);
     };
 
     detect();
     return () => clearTimeout(frameId);
-  }, []);
+  }, [scanSpeed]);
+
+  const drawBarcodeOverlay = (ctx, barcode) => {
+    const { x, y, width, height } = barcode.boundingBox;
+    ctx.strokeStyle = '#00ff88';
+    ctx.lineWidth = 6;
+    ctx.lineJoin = 'round';
+
+    // Corners
+    const len = Math.min(width, height) * 0.3;
+    ctx.beginPath();
+    ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y);
+    ctx.moveTo(x + width - len, y); ctx.lineTo(x + width, y); ctx.lineTo(x + width, y + len);
+    ctx.moveTo(x + width, y + height - len); ctx.lineTo(x + width, y + height); ctx.lineTo(x + width - len, y + height);
+    ctx.moveTo(x + len, y + height); ctx.lineTo(x, y + height); ctx.lineTo(x, y + height - len);
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(0, 255, 136, 0.2)';
+    ctx.fillRect(x, y, width, height);
+  };
+
+  const handleSuccess = (code) => {
+    const now = Date.now();
+    if (code === lastScannedCode.current.code && (now - lastScannedCode.current.time < 3000)) return;
+
+    lastScannedCode.current = { code, time: now };
+    setResults(prev => [{ code, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 5));
+
+    addLog(`SUCCÈS: ${code}`, 'success');
+    setShowPopup(true);
+    setTimeout(() => setShowPopup(false), 1000);
+
+    if (navigator.vibrate) navigator.vibrate(100);
+    confetti({ particleCount: 60, spread: 70, origin: { y: 0.6 }, colors: ['#00ff88', '#ffffff'] });
+  };
 
   return (
-    <div style={{ position: 'fixed', inset: 0, background: '#111', color: '#fff', fontFamily: 'system-ui' }}>
-      <video
-        ref={videoRef}
-        style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-        autoPlay playsInline muted
-      />
-
-      {/* Overlay UI */}
-      <div style={{ position: 'absolute', top: 0, left: 0, right: 0, padding: 20, background: 'linear-gradient(to bottom, rgba(0,0,0,0.8), transparent)', textAlign: 'center' }}>
-        <h1 style={{ margin: 0, fontSize: '1.2rem', letterSpacing: 2, color: '#0f8' }}>ENGINE V3.0</h1>
-        <div style={{ background: '#000', margin: '15px 0', padding: 10, borderRadius: 8, border: '1px solid #333', fontSize: '1.4rem', color: '#fff', wordBreak: 'break-all' }}>
-          {result}
-        </div>
+    <div className="scanner-container">
+      <div className={`detection-popup ${showPopup ? 'active' : ''}`}>
+        DÉTECTÉ !
       </div>
 
-      <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', width: '280px', height: '180px', border: '2px solid #0f8', borderRadius: 20, boxShadow: '0 0 20px rgba(0,255,136,0.3)', pointerEvents: 'none' }}>
-        <div style={{ position: 'absolute', top: '50%', width: '100%', height: '2px', background: 'rgba(0,255,136,0.5)', boxShadow: '0 0 10px #0f8', animation: 'scan 2s infinite linear' }} />
+      <div className="video-container">
+        <video ref={videoRef} className="video-feed" autoPlay playsInline muted />
+        <canvas ref={canvasRef} className="overlay-canvas" />
+        <div className="scanner-crosshair" />
+        <div className="scanning-line" />
       </div>
 
-      {/* Controls */}
-      <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, padding: 20, background: 'linear-gradient(to top, rgba(0,0,0,0.9), transparent)' }}>
-        <div style={{ marginBottom: 15, display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 10 }}>
-          {devices.map((dev, idx) => (
-            <button
-              key={dev.deviceId}
-              onClick={() => initCamera(dev.deviceId)}
-              style={{
-                flexShrink: 0, background: activeDeviceId === dev.deviceId ? '#0f8' : '#333',
-                color: activeDeviceId === dev.deviceId ? '#000' : '#fff',
-                border: 'none', padding: '10px 15px', borderRadius: 8, fontSize: '0.8rem',
-                fontWeight: 'bold', cursor: 'pointer'
-              }}
-            >
-              {dev.label || `Caméra ${idx + 1}`}
-            </button>
+      <div className="ui-layer">
+        <header className="header">
+          <h1>HYPER ENGINE V4</h1>
+          <button className="icon-button" onClick={() => setShowSettings(true)}>
+            <Settings size={22} color="#fff" />
+          </button>
+        </header>
+
+        <div className="debug-console">
+          {logs.map((log, i) => (
+            <div key={i} className={`log-entry ${log.type}`}>
+              [{log.time}] {log.msg}
+            </div>
           ))}
-          {devices.length === 0 && (
-            <button onClick={() => initCamera()} style={{ background: '#0f8', color: '#000', padding: '10px 20px', borderRadius: 8, border: 'none', fontWeight: 'bold' }}>
-              Forcer Détection Caméras
-            </button>
-          )}
         </div>
 
-        <div style={{ maxHeight: '100px', overflowY: 'auto', fontSize: '0.7rem', color: '#888' }}>
-          {logs.map((log, i) => <div key={i}>{log}</div>)}
+        <div className="results-list">
+          {results.map((res, i) => (
+            <div key={i} className="result-card">
+              <span className="code">{res.code}</span>
+              <span className="time">{res.time}</span>
+            </div>
+          ))}
         </div>
+
+        {showSettings && (
+          <div className="settings-drawer-overlay" onClick={() => setShowSettings(false)}>
+            <div className="settings-drawer" onClick={e => e.stopPropagation()}>
+              <div className="settings-header">
+                <h2>Réglages Avancés</h2>
+                <button className="icon-button" onClick={() => setShowSettings(false)}>
+                  <RefreshCw size={22} color="#fff" />
+                </button>
+              </div>
+              <div className="settings-content">
+                <section className="settings-section">
+                  <h3>Fluidité (Scan Speed)</h3>
+                  <div className="control-group">
+                    <input
+                      type="range" min="50" max="500" step="50"
+                      value={scanSpeed}
+                      onChange={(e) => setScanSpeed(parseInt(e.target.value))}
+                    />
+                    <span className="control-value">{scanSpeed}ms</span>
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <h3>Sélection Caméra</h3>
+                  <div className="device-list">
+                    {devices.map(device => (
+                      <button
+                        key={device.deviceId}
+                        className={`device-item ${activeDeviceId === device.deviceId ? 'active' : ''}`}
+                        onClick={() => initCamera(device.deviceId)}
+                      >
+                        <Camera size={18} />
+                        <span className="device-label">{device.label || `Caméra ${device.deviceId.slice(0, 5)}`}</span>
+                        {activeDeviceId === device.deviceId && <Check size={18} color="#00ff88" />}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <footer className="footer">
+          <div className="status-badge">
+            <div className="status-dot" />
+            OMNIDIRECTIONAL
+          </div>
+          <Zap size={20} color="#0f8" />
+        </footer>
       </div>
-
-      <style>{`
-        @keyframes scan {
-          0% { top: 10%; }
-          50% { top: 90%; }
-          100% { top: 10%; }
-        }
-      `}</style>
     </div>
   );
 }
