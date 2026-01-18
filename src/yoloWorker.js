@@ -20,39 +20,62 @@ self.onmessage = async (event) => {
   }
 
   if (type === 'INFER') {
-    if (!session) return;
+    if (!session) {
+      console.warn('Worker: Inference requested but session not loaded.');
+      return;
+    }
 
     try {
       const { tensor, originalWidth, originalHeight } = payload;
       const feeds = { [session.inputNames[0]]: tensor };
+
+      console.log('Worker: Starting inference run...');
       const results = await session.run(feeds);
       const output = results[session.outputNames[0]];
+      console.log('Worker: Inference complete. Output shape:', output.dims);
 
-      // Post-processing: YOLOv8 output is usually [1, classes + 4, 8400]
-      // We need to parse boxes and scores, apply confidence threshold and NMS
-      const detections = processYOLOv8Output(output.data, originalWidth, originalHeight);
+      const detections = processYOLOv8Output(output, originalWidth, originalHeight);
+      console.log('Worker: Detections found:', detections.length);
 
       self.postMessage({ type: 'INFERENCE_RESULT', payload: detections });
     } catch (e) {
+      console.error('Worker Inference Error:', e);
       self.postMessage({ type: 'ERROR', payload: e.message });
     }
   }
 };
 
-function processYOLOv8Output(data, width, height) {
-  // Simplified YOLOv8 parsing (v8-specific format)
-  // [x, y, w, h, score1, score2, ...]
-  const numDetections = 8400; // standard for 640x640 input
-  const numClasses = data.length / numDetections - 4;
+function processYOLOv8Output(output, width, height) {
+  const data = output.data;
+  const dims = output.dims; // [1, 84, 8400] or [1, 8400, 84]
+
+  let numDetections, numFeatures, isTransposed;
+
+  if (dims[1] > dims[2]) {
+    // [1, 8400, 84]
+    numDetections = dims[1];
+    numFeatures = dims[2];
+    isTransposed = true;
+  } else {
+    // [1, 84, 8400]
+    numDetections = dims[2];
+    numFeatures = dims[1];
+    isTransposed = false;
+  }
+
+  const numClasses = numFeatures - 4;
   const detections = [];
-  const confidenceThreshold = 0.5;
+  const confidenceThreshold = 0.3; // Lowered for debugging
 
   for (let i = 0; i < numDetections; i++) {
     let maxScore = 0;
     let maxClass = -1;
 
     for (let c = 0; c < numClasses; c++) {
-      const score = data[i + numDetections * (c + 4)];
+      const score = isTransposed
+        ? data[i * numFeatures + (c + 4)]
+        : data[numDetections * (c + 4) + i];
+
       if (score > maxScore) {
         maxScore = score;
         maxClass = c;
@@ -60,10 +83,10 @@ function processYOLOv8Output(data, width, height) {
     }
 
     if (maxScore > confidenceThreshold) {
-      const x = data[i + numDetections * 0];
-      const y = data[i + numDetections * 1];
-      const w = data[i + numDetections * 2];
-      const h = data[i + numDetections * 3];
+      const x = isTransposed ? data[i * numFeatures + 0] : data[numDetections * 0 + i];
+      const y = isTransposed ? data[i * numFeatures + 1] : data[numDetections * 1 + i];
+      const w = isTransposed ? data[i * numFeatures + 2] : data[numDetections * 2 + i];
+      const h = isTransposed ? data[i * numFeatures + 3] : data[numDetections * 3 + i];
 
       // Convert to normalization coords (assuming 640x640 input)
       // and then to original image coords

@@ -104,11 +104,14 @@ function App() {
 
   const startDetectionLoop = () => {
     const processFrame = async () => {
-      if (!videoRef.current || !isReady) return;
+      if (!videoRef.current || !isReady) {
+        setTimeout(processFrame, 500);
+        return;
+      }
 
       const video = videoRef.current;
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        // Capture frame
+        console.log('Capture frame for inference...');
         const offscreenCanvas = document.createElement('canvas');
         offscreenCanvas.width = YOLO_INPUT_SIZE;
         offscreenCanvas.height = YOLO_INPUT_SIZE;
@@ -126,8 +129,10 @@ function App() {
             originalHeight: video.videoHeight
           }
         });
+      } else {
+        console.log('Video not ready or no data...');
       }
-      setTimeout(processFrame, 150); // ~7 FPS detection for battery/performance
+      setTimeout(processFrame, 150);
     };
     processFrame();
   };
