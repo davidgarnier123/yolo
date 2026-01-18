@@ -1,50 +1,67 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } from '@zxing/library';
+import { BrowserMultiFormatReader, BarcodeFormat } from '@zxing/library';
+import * as ort from 'onnxruntime-web';
 import { Camera, Zap, History, ShieldCheck, Settings, X, Check } from 'lucide-react';
 import confetti from 'canvas-confetti';
+
+const YOLO_INPUT_SIZE = 640;
 
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const workerRef = useRef(null);
   const [results, setResults] = useState([]);
-  const [status, setStatus] = useState('Initializing...');
+  const [status, setStatus] = useState('Initialisation...');
   const [isReady, setIsReady] = useState(false);
   const [devices, setDevices] = useState([]);
   const [currentDeviceId, setCurrentDeviceId] = useState('');
   const [showSettings, setShowSettings] = useState(false);
 
-  // ZXing Reader
+  // ZXing Reader for localized decoding
   const zxingReader = useRef(null);
   const lastScannedCode = useRef({ code: '', time: 0 });
 
   useEffect(() => {
-    // Initialize ZXing with hints for better performance
+    // Initialize ZXing with Code 128 priority
     const hints = new Map();
-    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
-      BarcodeFormat.CODE_128,
-      BarcodeFormat.QR_CODE,
-      BarcodeFormat.EAN_13,
-      BarcodeFormat.CODE_39
-    ]);
-
+    hints.set(2, [BarcodeFormat.CODE_128, BarcodeFormat.QR_CODE]); // 2 is DecodeHintType.POSSIBLE_FORMATS
     zxingReader.current = new BrowserMultiFormatReader(hints);
+    // Initialize Web Worker
+    const worker = new Worker(new URL('./yoloWorker.js', import.meta.url), { type: 'module' });
+    workerRef.current = worker;
+
+    worker.onmessage = (e) => {
+      const { type, payload } = e.data;
+      if (type === 'MODEL_LOADED') {
+        setStatus('Ready');
+        setIsReady(true);
+        startDetectionLoop();
+      } else if (type === 'INFERENCE_RESULT') {
+        handleDetections(payload);
+      } else if (type === 'ERROR') {
+        setStatus(`Error: ${payload}`);
+      }
+    };
+
+    // Load Model
+    worker.postMessage({
+      type: 'LOAD_MODEL',
+      payload: { modelUrl: window.location.origin + '/models/yolov8n-barcode.onnx' }
+    });
 
     setupCamera();
 
     return () => {
+      workerRef.current?.terminate();
       if (videoRef.current?.srcObject) {
         videoRef.current.srcObject.getTracks().forEach(track => track.stop());
-      }
-      if (zxingReader.current) {
-        zxingReader.current.reset();
       }
     };
   }, []);
 
   const setupCamera = async (deviceId = '') => {
     try {
-      setStatus('Connecting to camera...');
-
+      setStatus('Connecting...');
       const availableDevices = await navigator.mediaDevices.enumerateDevices();
       const videoDevices = availableDevices.filter(d => d.kind === 'videoinput');
       setDevices(videoDevices);
@@ -59,7 +76,6 @@ function App() {
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         const currentTrack = stream.getVideoTracks()[0];
@@ -67,18 +83,9 @@ function App() {
           const settings = currentTrack.getSettings();
           setCurrentDeviceId(settings.deviceId);
         }
-
-        // Start scanning once video is ready
-        videoRef.current.onloadedmetadata = () => {
-          setStatus('Ready');
-          setIsReady(true);
-          startScanning();
-        };
       }
-
       const updatedDevices = await navigator.mediaDevices.enumerateDevices();
       setDevices(updatedDevices.filter(d => d.kind === 'videoinput'));
-
     } catch (err) {
       console.error('Camera Error:', err);
       setStatus('Camera Error: ' + err.message);
@@ -89,82 +96,139 @@ function App() {
     if (videoRef.current?.srcObject) {
       videoRef.current.srcObject.getTracks().forEach(track => track.stop());
     }
-    if (zxingReader.current) {
-      zxingReader.current.reset();
-    }
     setCurrentDeviceId(newDeviceId);
     setupCamera(newDeviceId);
   };
 
-  const startScanning = async () => {
-    if (!videoRef.current || !zxingReader.current) return;
+  const startDetectionLoop = () => {
+    const processFrame = async () => {
+      if (!videoRef.current || !isReady) {
+        requestAnimationFrame(processFrame);
+        return;
+      }
 
-    try {
-      await zxingReader.current.decodeFromVideoElement(videoRef.current, (result, error) => {
-        if (result) {
-          const code = result.getText();
-          const points = result.getResultPoints();
+      const video = videoRef.current;
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        const offscreenCanvas = document.createElement('canvas');
+        offscreenCanvas.width = YOLO_INPUT_SIZE;
+        offscreenCanvas.height = YOLO_INPUT_SIZE;
+        const ctx = offscreenCanvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
 
-          // Draw detection UI
-          drawResultPoints(points);
+        const imageData = ctx.getImageData(0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
+        const tensor = imageDataToTensor(imageData);
 
-          handleSuccess(code);
-        }
-
-        // Clean canvas if no detection (optional, but keeps it tidy)
-        if (error && !result) {
-          const canvas = canvasRef.current;
-          if (canvas) {
-            const ctx = canvas.getContext('2d');
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        workerRef.current.postMessage({
+          type: 'FRAME',
+          payload: {
+            tensor,
+            originalWidth: video.videoWidth,
+            originalHeight: video.videoHeight
           }
-        }
-      });
-    } catch (err) {
-      console.error('Scan Error:', err);
-    }
+        });
+      }
+      // Speed check for iOS battery (can be adjusted)
+      setTimeout(() => requestAnimationFrame(processFrame), 150);
+    };
+    processFrame();
   };
 
-  const drawResultPoints = (points) => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video || !points || points.length < 2) return;
+  const imageDataToTensor = (imageData) => {
+    const { data } = imageData;
+    const [red, green, blue] = [
+      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE),
+      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE),
+      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE)
+    ];
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    for (let i = 0; i < data.length; i += 4) {
+      red[i / 4] = data[i] / 255.0;
+      green[i / 4] = data[i + 1] / 255.0;
+      blue[i / 4] = data[i + 2] / 255.0;
+    }
+
+    const inputData = new Float32Array(3 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
+    inputData.set(red, 0);
+    inputData.set(green, YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
+    inputData.set(blue, 2 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
+
+    return new ort.Tensor('float32', inputData, [1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE]);
+  };
+
+  const handleDetections = async (payload) => {
+    const { detections, originalWidth, originalHeight } = payload;
+    const canvas = canvasRef.current;
+    if (!canvas || !videoRef.current) return;
+
+    canvas.width = originalWidth;
+    canvas.height = originalHeight;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Calculate bounding box from points
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    points.forEach(p => {
-      minX = Math.min(minX, p.x);
-      minY = Math.min(minY, p.y);
-      maxX = Math.max(maxX, p.x);
-      maxY = Math.max(maxY, p.y);
-    });
+    await Promise.all(detections.map(async (det) => {
+      const { x, y, w, h, confidence } = det;
 
-    const w = maxX - minX;
-    const h = maxY - minY;
-    const padding = 20;
+      // Visual feedback
+      drawDetectionBox(ctx, x, y, w, h);
+      ctx.fillStyle = '#00ff88';
+      ctx.font = 'bold 16px Inter';
+      ctx.fillText(`${(confidence * 100).toFixed(0)}%`, x, y - 10);
 
-    // Draw HUD Box
-    drawHUDBox(ctx, minX - padding, minY - padding, w + padding * 2, h + padding * 2);
+      // Localized Decoding
+      const code = await decodeROI(det);
+      if (code) {
+        // Draw real-time code
+        ctx.font = 'bold 22px Inter';
+        const textWidth = ctx.measureText(code).width;
+        ctx.fillStyle = 'rgba(0,0,0,0.8)';
+        ctx.roundRect(x, y + h + 10, textWidth + 20, 35, 10);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(code, x + 10, y + h + 35);
+
+        handleSuccess(code);
+      }
+    }));
   };
 
-  const drawHUDBox = (ctx, x, y, w, h) => {
+  const drawDetectionBox = (ctx, x, y, w, h) => {
     ctx.strokeStyle = '#00ff88';
-    ctx.lineWidth = 3;
-    const len = Math.min(w, h) * 0.2;
+    ctx.lineWidth = 4;
+    const len = Math.min(w, h) * 0.25;
 
-    // Corners
+    // Stylish corners
     ctx.beginPath(); ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x, y + h - len); ctx.lineTo(x, y + h); ctx.lineTo(x + len, y + h); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x + w - len, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - len); ctx.stroke();
 
-    ctx.fillStyle = 'rgba(0, 255, 136, 0.1)';
+    ctx.fillStyle = 'rgba(0, 255, 136, 0.15)';
     ctx.fillRect(x, y, w, h);
+  };
+
+  const decodeROI = async (det) => {
+    const { x, y, w, h } = det;
+    const video = videoRef.current;
+    if (!video) return null;
+
+    const padding = 20;
+    const bx = Math.max(0, x - padding);
+    const by = Math.max(0, y - padding);
+    const bw = Math.min(video.videoWidth - bx, w + padding * 2);
+    const bh = Math.min(video.videoHeight - by, h + padding * 2);
+
+    const roiCanvas = document.createElement('canvas');
+    roiCanvas.width = bw;
+    roiCanvas.height = bh;
+    const roiCtx = roiCanvas.getContext('2d');
+    roiCtx.drawImage(video, bx, by, bw, bh, 0, 0, bw, bh);
+
+    try {
+      const result = await zxingReader.current.decodeFromCanvas(roiCanvas);
+      return result ? result.getText() : null;
+    } catch (e) {
+      return null;
+    }
   };
 
   const handleSuccess = (code) => {
@@ -181,10 +245,7 @@ function App() {
       setTimeout(() => appContainer.classList.remove('scan-success'), 200);
     }
     if (navigator.vibrate) navigator.vibrate(50);
-
-    confetti({
-      particleCount: 40, spread: 70, origin: { y: 0.6 }, colors: ['#00ff88', '#ffffff']
-    });
+    confetti({ particleCount: 50, spread: 80, origin: { y: 0.6 }, colors: ['#00ff88', '#ffffff'] });
   };
 
   return (
@@ -197,8 +258,8 @@ function App() {
 
       <div className="ui-layer">
         <header className="header">
-          <h1>AI HYPER SCAN</h1>
-          <button className="icon-button" onClick={() => setShowSettings(true)} style={{ pointerEvents: 'auto' }}>
+          <h1>CODE 128 HYPER FAST</h1>
+          <button className="icon-button" onClick={() => setShowSettings(true)}>
             <Settings size={24} color="#fff" />
           </button>
         </header>
@@ -221,32 +282,27 @@ function App() {
                   <X size={24} color="#fff" />
                 </button>
               </div>
-
               <div className="settings-content">
                 <section className="settings-section">
                   <h3>Select Camera</h3>
                   <div className="device-list">
-                    {devices.length === 0 ? (
-                      <p className="empty-text">No cameras found or access denied.</p>
-                    ) : (
-                      devices.map(device => (
-                        <button
-                          key={device.deviceId}
-                          className={`device-item ${currentDeviceId === device.deviceId ? 'active' : ''}`}
-                          onClick={() => handleDeviceChange(device.deviceId)}
-                        >
-                          <Camera size={18} />
-                          <span className="device-label">{device.label || `Camera ${device.deviceId.slice(0, 5)}...`}</span>
-                          {currentDeviceId === device.deviceId && <Check size={18} color="#00ff88" />}
-                        </button>
-                      ))
-                    )}
+                    {devices.map(device => (
+                      <button
+                        key={device.deviceId}
+                        className={`device-item ${currentDeviceId === device.deviceId ? 'active' : ''}`}
+                        onClick={() => handleDeviceChange(device.deviceId)}
+                      >
+                        <Camera size={18} />
+                        <span className="device-label">{device.label || `Camera ${device.deviceId.slice(0, 5)}...`}</span>
+                        {currentDeviceId === device.deviceId && <Check size={18} color="#00ff88" />}
+                      </button>
+                    ))}
                   </div>
                 </section>
-
                 <section className="settings-section">
-                  <h3>About</h3>
-                  <p className="version-text">Version 1.5.0 - AI Barcode Scanner</p>
+                  <h3>Engine</h3>
+                  <p className="version-text">Hybrid YOLOv8 + ZXing Engine</p>
+                  <p className="version-text">Version 2.0.0 (Robust iOS)</p>
                 </section>
               </div>
             </div>
