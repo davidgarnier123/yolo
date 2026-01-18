@@ -17,11 +17,19 @@ function App() {
   const [currentDeviceId, setCurrentDeviceId] = useState('');
   const [showSettings, setShowSettings] = useState(false);
 
+  const [logs, setLogs] = useState([{ msg: 'Initialisation du système...', type: 'info' }]);
+  const [showPopup, setShowPopup] = useState(false);
+
+  const addLog = (msg, type = 'info') => {
+    setLogs(prev => [{ msg, type, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 15));
+  };
+
   // ZXing Reader for localized decoding
   const zxingReader = useRef(null);
   const lastScannedCode = useRef({ code: '', time: 0 });
 
   useEffect(() => {
+    addLog('Démarrage de l\'application');
     // Initialize ZXing with Code 128 priority
     const hints = new Map();
     hints.set(2, [BarcodeFormat.CODE_128, BarcodeFormat.QR_CODE]); // 2 is DecodeHintType.POSSIBLE_FORMATS
@@ -35,11 +43,13 @@ function App() {
       if (type === 'MODEL_LOADED') {
         setStatus('Ready');
         setIsReady(true);
+        addLog('Modèle YOLO chargé avec succès !', 'success');
         startDetectionLoop();
       } else if (type === 'INFERENCE_RESULT') {
         handleDetections(payload);
       } else if (type === 'ERROR') {
         setStatus(`Error: ${payload}`);
+        addLog(`ERREUR: ${payload}`, 'error');
       }
     };
 
@@ -76,6 +86,7 @@ function App() {
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      addLog('Flux caméra activé');
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         const currentTrack = stream.getVideoTracks()[0];
@@ -87,12 +98,13 @@ function App() {
       const updatedDevices = await navigator.mediaDevices.enumerateDevices();
       setDevices(updatedDevices.filter(d => d.kind === 'videoinput'));
     } catch (err) {
-      console.error('Camera Error:', err);
+      addLog(`Erreur Caméra: ${err.message}`, 'error');
       setStatus('Camera Error: ' + err.message);
     }
   };
 
   const handleDeviceChange = (newDeviceId) => {
+    addLog('Changement de caméra...');
     if (videoRef.current?.srcObject) {
       videoRef.current.srcObject.getTracks().forEach(track => track.stop());
     }
@@ -101,6 +113,7 @@ function App() {
   };
 
   const startDetectionLoop = () => {
+    addLog('Boucle de détection lancée à 7 FPS');
     const processFrame = async () => {
       if (!videoRef.current || !isReady) {
         requestAnimationFrame(processFrame);
@@ -128,7 +141,7 @@ function App() {
         });
       }
       // Speed check for iOS battery (can be adjusted)
-      setTimeout(() => requestAnimationFrame(processFrame), 150);
+      setTimeout(() => requestAnimationFrame(processFrame), 140);
     };
     processFrame();
   };
@@ -160,6 +173,10 @@ function App() {
     const canvas = canvasRef.current;
     if (!canvas || !videoRef.current) return;
 
+    if (detections.length > 0) {
+      // Optionnel: addLog(`Cible détectée (${detections.length})`, 'info');
+    }
+
     canvas.width = originalWidth;
     canvas.height = originalHeight;
     const ctx = canvas.getContext('2d');
@@ -171,30 +188,21 @@ function App() {
       // Visual feedback
       drawDetectionBox(ctx, x, y, w, h);
       ctx.fillStyle = '#00ff88';
-      ctx.font = 'bold 16px Inter';
-      ctx.fillText(`${(confidence * 100).toFixed(0)}%`, x, y - 10);
+      ctx.font = 'bold 24px Inter';
+      ctx.fillText(`${(confidence * 100).toFixed(0)}%`, x, y - 15);
 
       // Localized Decoding
       const code = await decodeROI(det);
       if (code) {
-        // Draw real-time code
-        ctx.font = 'bold 22px Inter';
-        const textWidth = ctx.measureText(code).width;
-        ctx.fillStyle = 'rgba(0,0,0,0.8)';
-        ctx.roundRect(x, y + h + 10, textWidth + 20, 35, 10);
-        ctx.fill();
-        ctx.fillStyle = '#fff';
-        ctx.fillText(code, x + 10, y + h + 35);
-
-        handleSuccess(code);
+        handleSuccess(code, { x, y, w, h });
       }
     }));
   };
 
   const drawDetectionBox = (ctx, x, y, w, h) => {
     ctx.strokeStyle = '#00ff88';
-    ctx.lineWidth = 4;
-    const len = Math.min(w, h) * 0.25;
+    ctx.lineWidth = 6; // Plus épais
+    const len = Math.min(w, h) * 0.3;
 
     // Stylish corners
     ctx.beginPath(); ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y); ctx.stroke();
@@ -202,7 +210,7 @@ function App() {
     ctx.beginPath(); ctx.moveTo(x, y + h - len); ctx.lineTo(x, y + h); ctx.lineTo(x + len, y + h); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x + w - len, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - len); ctx.stroke();
 
-    ctx.fillStyle = 'rgba(0, 255, 136, 0.15)';
+    ctx.fillStyle = 'rgba(0, 255, 136, 0.2)';
     ctx.fillRect(x, y, w, h);
   };
 
@@ -211,7 +219,7 @@ function App() {
     const video = videoRef.current;
     if (!video) return null;
 
-    const padding = 20;
+    const padding = 40; // Plus de padding pour ZXing
     const bx = Math.max(0, x - padding);
     const by = Math.max(0, y - padding);
     const bw = Math.min(video.videoWidth - bx, w + padding * 2);
@@ -231,12 +239,16 @@ function App() {
     }
   };
 
-  const handleSuccess = (code) => {
+  const handleSuccess = (code, box) => {
     const now = Date.now();
     if (code === lastScannedCode.current.code && (now - lastScannedCode.current.time < 3000)) return;
 
     lastScannedCode.current = { code, time: now };
     setResults(prev => [{ code, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 5));
+
+    addLog(`DÉCODÉ : ${code}`, 'success');
+    setShowPopup(true);
+    setTimeout(() => setShowPopup(false), 800);
 
     // Feedback
     const appContainer = document.querySelector('.scanner-container');
@@ -244,12 +256,16 @@ function App() {
       appContainer.classList.add('scan-success');
       setTimeout(() => appContainer.classList.remove('scan-success'), 200);
     }
-    if (navigator.vibrate) navigator.vibrate(50);
-    confetti({ particleCount: 50, spread: 80, origin: { y: 0.6 }, colors: ['#00ff88', '#ffffff'] });
+    if (navigator.vibrate) navigator.vibrate(100);
+    confetti({ particleCount: 60, spread: 90, origin: { y: 0.5 }, colors: ['#00ff88', '#ffffff'] });
   };
 
   return (
     <div className="scanner-container">
+      <div className={`detection-popup ${showPopup ? 'active' : ''}`}>
+        DETECTED!
+      </div>
+
       <div className="video-container">
         <video ref={videoRef} className="video-feed" autoPlay playsInline muted />
         <canvas ref={canvasRef} className="overlay-canvas" />
@@ -258,11 +274,19 @@ function App() {
 
       <div className="ui-layer">
         <header className="header">
-          <h1>CODE 128 HYPER FAST</h1>
+          <h1>HYPER SCAN PRO</h1>
           <button className="icon-button" onClick={() => setShowSettings(true)}>
             <Settings size={24} color="#fff" />
           </button>
         </header>
+
+        <div className="debug-console">
+          {logs.map((log, i) => (
+            <div key={i} className={`log-entry ${log.type}`}>
+              [{log.time}] {log.msg}
+            </div>
+          ))}
+        </div>
 
         <div className="results-list">
           {results.map((res, i) => (
