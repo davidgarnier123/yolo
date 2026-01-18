@@ -1,8 +1,8 @@
 import * as ort from 'onnxruntime-web';
 
 let session;
-const origin = self.location.origin;
-ort.env.wasm.wasmPaths = origin + '/wasm/';
+// Use CDN for more reliable module loading in Vite/Vercel environments
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
 
 self.onmessage = async (event) => {
   const { type, payload } = event.data;
