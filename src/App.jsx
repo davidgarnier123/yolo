@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { BrowserMultiFormatReader, BarcodeFormat } from '@zxing/library';
 import * as ort from 'onnxruntime-web';
-import { Camera, Zap, History, ShieldCheck } from 'lucide-react';
+import { Camera, Zap, History, ShieldCheck, Settings, X, Check } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
 const YOLO_INPUT_SIZE = 640;
@@ -13,6 +13,9 @@ function App() {
   const [results, setResults] = useState([]);
   const [status, setStatus] = useState('Initializing...');
   const [isReady, setIsReady] = useState(false);
+  const [devices, setDevices] = useState([]);
+  const [currentDeviceId, setCurrentDeviceId] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
 
   // ZXing Reader for localized decoding
   const zxingReader = useRef(new BrowserMultiFormatReader());
@@ -35,8 +38,7 @@ function App() {
       }
     };
 
-    // Load Model (Placeholder URL - User should provide a real YOLOv8 barcode ONNX model)
-    // For demo purposes, we'll try to load a generic one or explain
+    // Load Model
     workerRef.current.postMessage({
       type: 'LOAD_MODEL',
       payload: { modelUrl: window.location.origin + '/models/yolov8n-barcode.onnx' }
@@ -46,23 +48,58 @@ function App() {
 
     return () => {
       workerRef.current?.terminate();
+      if (videoRef.current?.srcObject) {
+        videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+      }
     };
   }, []);
 
-  const setupCamera = async () => {
+  const setupCamera = async (deviceId = '') => {
     try {
       console.log('Requesting camera access...');
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
-      });
+
+      // Enumerate devices first or after permission
+      const availableDevices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = availableDevices.filter(d => d.kind === 'videoinput');
+      setDevices(videoDevices);
+
+      const constraints = {
+        video: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          facingMode: deviceId ? undefined : 'environment',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
       console.log('Camera stream obtained.');
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        const currentTrack = stream.getVideoTracks()[0];
+        if (currentTrack) {
+          const settings = currentTrack.getSettings();
+          setCurrentDeviceId(settings.deviceId);
+        }
       }
+
+      // Re-enumerate to get labels if they were hidden before permission
+      const updatedDevices = await navigator.mediaDevices.enumerateDevices();
+      setDevices(updatedDevices.filter(d => d.kind === 'videoinput'));
+
     } catch (err) {
       console.error('Camera Error:', err);
       setStatus('Camera Error: ' + err.message);
     }
+  };
+
+  const handleDeviceChange = (newDeviceId) => {
+    if (videoRef.current?.srcObject) {
+      videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+    }
+    setCurrentDeviceId(newDeviceId);
+    setupCamera(newDeviceId);
   };
 
   const startDetectionLoop = () => {
@@ -258,14 +295,18 @@ function App() {
 
   return (
     <div className="scanner-container">
-      <video ref={videoRef} className="video-feed" autoPlay playsInline muted />
-      <canvas ref={canvasRef} className="overlay-canvas" />
-
-      <div className="scanner-crosshair" />
+      <div className="video-container">
+        <video ref={videoRef} className="video-feed" autoPlay playsInline muted />
+        <canvas ref={canvasRef} className="overlay-canvas" />
+        <div className="scanner-crosshair" />
+      </div>
 
       <div className="ui-layer">
         <header className="header">
           <h1>AI HYPER SCAN</h1>
+          <button className="icon-button" onClick={() => setShowSettings(true)} style={{ pointerEvents: 'auto' }}>
+            <Settings size={24} color="#fff" />
+          </button>
         </header>
 
         <div className="results-list">
@@ -276,6 +317,47 @@ function App() {
             </div>
           ))}
         </div>
+
+        {showSettings && (
+          <div className="settings-drawer-overlay" onClick={() => setShowSettings(false)}>
+            <div className="settings-drawer" onClick={e => e.stopPropagation()}>
+              <div className="settings-header">
+                <h2>Settings</h2>
+                <button className="icon-button" onClick={() => setShowSettings(false)}>
+                  <X size={24} color="#fff" />
+                </button>
+              </div>
+
+              <div className="settings-content">
+                <section className="settings-section">
+                  <h3>Select Camera</h3>
+                  <div className="device-list">
+                    {devices.length === 0 ? (
+                      <p className="empty-text">No cameras found or access denied.</p>
+                    ) : (
+                      devices.map(device => (
+                        <button
+                          key={device.deviceId}
+                          className={`device-item ${currentDeviceId === device.deviceId ? 'active' : ''}`}
+                          onClick={() => handleDeviceChange(device.deviceId)}
+                        >
+                          <Camera size={18} />
+                          <span className="device-label">{device.label || `Camera ${device.deviceId.slice(0, 5)}...`}</span>
+                          {currentDeviceId === device.deviceId && <Check size={18} color="#00ff88" />}
+                        </button>
+                      ))
+                    )}
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <h3>About</h3>
+                  <p className="version-text">Version 1.5.0 - AI Barcode Scanner</p>
+                </section>
+              </div>
+            </div>
+          </div>
+        )}
 
         <footer className="footer">
           <div className="status-badge">
