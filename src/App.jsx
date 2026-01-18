@@ -39,7 +39,7 @@ function App() {
     // For demo purposes, we'll try to load a generic one or explain
     workerRef.current.postMessage({
       type: 'LOAD_MODEL',
-      payload: { modelUrl: '/models/yolov8n-barcode.onnx' }
+      payload: { modelUrl: window.location.origin + '/models/yolov8n-barcode.onnx' }
     });
 
     setupCamera();
