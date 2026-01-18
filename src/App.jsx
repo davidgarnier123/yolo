@@ -60,20 +60,23 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Explicit formats help the engine focus and handle rotation better
+    // Narrowing formats to increase speed and robustness for Code 128
     const detector = new BarcodeDetector({
-      formats: ['code_128', 'qr_code', 'ean_13', 'code_39', 'itf', 'data_matrix']
+      formats: ['code_128', 'qr_code', 'ean_13']
     });
     let frameId;
+    let lastProcessedTime = 0;
 
     const detect = async () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      if (video && video.readyState >= 2 && canvas) {
+
+      const now = Date.now();
+      if (video && video.readyState >= 2 && canvas && (now - lastProcessedTime >= scanSpeed)) {
+        lastProcessedTime = now;
         try {
           const barcodes = await detector.detect(video);
 
-          // Draw feedback
           canvas.width = video.videoWidth;
           canvas.height = video.videoHeight;
           const ctx = canvas.getContext('2d');
@@ -86,14 +89,14 @@ export default function App() {
             });
           }
         } catch (e) {
-          // Detection fail (no barcode)
+          // ignore
         }
       }
-      frameId = setTimeout(() => requestAnimationFrame(detect), scanSpeed);
+      frameId = requestAnimationFrame(detect);
     };
 
     detect();
-    return () => clearTimeout(frameId);
+    return () => cancelAnimationFrame(frameId);
   }, [scanSpeed]);
 
   const drawBarcodeOverlay = (ctx, barcode) => {
@@ -145,13 +148,21 @@ export default function App() {
 
       <div className="ui-layer">
         <header className="header">
-          <h1>HYPER ENGINE V4</h1>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <h1>HYPER ENGINE V4</h1>
+            <button className="icon-button" onClick={() => initCamera(activeDeviceId)} title="Redémarrer Caméra">
+              <RefreshCw size={18} color="#0f8" />
+            </button>
+          </div>
           <button className="icon-button" onClick={() => setShowSettings(true)}>
             <Settings size={22} color="#fff" />
           </button>
         </header>
 
         <div className="debug-console">
+          <div className="log-entry info" style={{ borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: 5, marginBottom: 5, fontWeight: 'bold' }}>
+            STATUT: {status === 'Prêt' ? 'ACTIVE' : status} | MOTEUR: GOOGLE (WASM)
+          </div>
           {logs.map((log, i) => (
             <div key={i} className={`log-entry ${log.type}`}>
               [{log.time}] {log.msg}
