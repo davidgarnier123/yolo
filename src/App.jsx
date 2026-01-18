@@ -1,15 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { BrowserMultiFormatReader, BarcodeFormat } from '@zxing/library';
-import * as ort from 'onnxruntime-web';
+import { BrowserMultiFormatReader, BarcodeFormat, DecodeHintType } from '@zxing/library';
 import { Camera, Zap, History, ShieldCheck, Settings, X, Check } from 'lucide-react';
 import confetti from 'canvas-confetti';
-
-const YOLO_INPUT_SIZE = 640;
 
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const workerRef = useRef(null);
   const [results, setResults] = useState([]);
   const [status, setStatus] = useState('Initializing...');
   const [isReady, setIsReady] = useState(false);
@@ -17,48 +13,38 @@ function App() {
   const [currentDeviceId, setCurrentDeviceId] = useState('');
   const [showSettings, setShowSettings] = useState(false);
 
-  // ZXing Reader for localized decoding
-  const zxingReader = useRef(new BrowserMultiFormatReader());
+  // ZXing Reader
+  const zxingReader = useRef(null);
   const lastScannedCode = useRef({ code: '', time: 0 });
 
   useEffect(() => {
-    // Initialize Web Worker
-    workerRef.current = new Worker(new URL('./yoloWorker.js', import.meta.url), { type: 'module' });
+    // Initialize ZXing with hints for better performance
+    const hints = new Map();
+    hints.set(DecodeHintType.POSSIBLE_FORMATS, [
+      BarcodeFormat.CODE_128,
+      BarcodeFormat.QR_CODE,
+      BarcodeFormat.EAN_13,
+      BarcodeFormat.CODE_39
+    ]);
 
-    workerRef.current.onmessage = (e) => {
-      const { type, payload } = e.data;
-      if (type === 'MODEL_LOADED') {
-        setStatus('Ready');
-        setIsReady(true);
-        startDetectionLoop();
-      } else if (type === 'INFERENCE_RESULT') {
-        handleDetections(payload);
-      } else if (type === 'ERROR') {
-        setStatus(`Error: ${payload}`);
-      }
-    };
-
-    // Load Model
-    workerRef.current.postMessage({
-      type: 'LOAD_MODEL',
-      payload: { modelUrl: window.location.origin + '/models/yolov8n-barcode.onnx' }
-    });
+    zxingReader.current = new BrowserMultiFormatReader(hints);
 
     setupCamera();
 
     return () => {
-      workerRef.current?.terminate();
       if (videoRef.current?.srcObject) {
         videoRef.current.srcObject.getTracks().forEach(track => track.stop());
+      }
+      if (zxingReader.current) {
+        zxingReader.current.reset();
       }
     };
   }, []);
 
   const setupCamera = async (deviceId = '') => {
     try {
-      console.log('Requesting camera access...');
+      setStatus('Connecting to camera...');
 
-      // Enumerate devices first or after permission
       const availableDevices = await navigator.mediaDevices.enumerateDevices();
       const videoDevices = availableDevices.filter(d => d.kind === 'videoinput');
       setDevices(videoDevices);
@@ -73,7 +59,6 @@ function App() {
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      console.log('Camera stream obtained.');
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -82,9 +67,15 @@ function App() {
           const settings = currentTrack.getSettings();
           setCurrentDeviceId(settings.deviceId);
         }
+
+        // Start scanning once video is ready
+        videoRef.current.onloadedmetadata = () => {
+          setStatus('Ready');
+          setIsReady(true);
+          startScanning();
+        };
       }
 
-      // Re-enumerate to get labels if they were hidden before permission
       const updatedDevices = await navigator.mediaDevices.enumerateDevices();
       setDevices(updatedDevices.filter(d => d.kind === 'videoinput'));
 
@@ -98,203 +89,101 @@ function App() {
     if (videoRef.current?.srcObject) {
       videoRef.current.srcObject.getTracks().forEach(track => track.stop());
     }
+    if (zxingReader.current) {
+      zxingReader.current.reset();
+    }
     setCurrentDeviceId(newDeviceId);
     setupCamera(newDeviceId);
   };
 
-  const startDetectionLoop = () => {
-    const processFrame = async () => {
-      if (!videoRef.current || !isReady) {
-        setTimeout(processFrame, 500);
-        return;
-      }
+  const startScanning = async () => {
+    if (!videoRef.current || !zxingReader.current) return;
 
-      const video = videoRef.current;
-      if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        console.log('Capture frame for inference...');
-        const offscreenCanvas = document.createElement('canvas');
-        offscreenCanvas.width = YOLO_INPUT_SIZE;
-        offscreenCanvas.height = YOLO_INPUT_SIZE;
-        const ctx = offscreenCanvas.getContext('2d');
-        ctx.drawImage(video, 0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
+    try {
+      await zxingReader.current.decodeFromVideoElement(videoRef.current, (result, error) => {
+        if (result) {
+          const code = result.getText();
+          const points = result.getResultPoints();
 
-        const imageData = ctx.getImageData(0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
-        const tensor = preprocess(imageData);
+          // Draw detection UI
+          drawResultPoints(points);
 
-        workerRef.current.postMessage({
-          type: 'INFER',
-          payload: {
-            tensor,
-            originalWidth: video.videoWidth,
-            originalHeight: video.videoHeight
+          handleSuccess(code);
+        }
+
+        // Clean canvas if no detection (optional, but keeps it tidy)
+        if (error && !result) {
+          const canvas = canvasRef.current;
+          if (canvas) {
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
           }
-        });
-      } else {
-        console.log('Video not ready or no data...');
-      }
-      setTimeout(processFrame, 150);
-    };
-    processFrame();
-  };
-
-  const preprocess = (imageData) => {
-    const { data } = imageData;
-    const [red, green, blue] = [
-      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE),
-      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE),
-      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE)
-    ];
-
-    for (let i = 0; i < data.length; i += 4) {
-      red[i / 4] = data[i] / 255.0;
-      green[i / 4] = data[i + 1] / 255.0;
-      blue[i / 4] = data[i + 2] / 255.0;
+        }
+      });
+    } catch (err) {
+      console.error('Scan Error:', err);
     }
-
-    const inputData = new Float32Array(3 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
-    inputData.set(red, 0);
-    inputData.set(green, YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
-    inputData.set(blue, 2 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
-
-    return new ort.Tensor('float32', inputData, [1, 3, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE]);
   };
 
-  const handleDetections = async (detections) => {
+  const drawResultPoints = (points) => {
     const canvas = canvasRef.current;
-    if (!canvas || !videoRef.current) return;
+    const video = videoRef.current;
+    if (!canvas || !video || !points || points.length < 2) return;
 
-    canvas.width = videoRef.current.videoWidth;
-    canvas.height = videoRef.current.videoHeight;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Process all detections in parallel for speed
-    await Promise.all(detections.map(async (det) => {
-      const { box, confidence } = det;
-      const [x, y, w, h] = box;
+    // Calculate bounding box from points
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    points.forEach(p => {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    });
 
-      // Draw stylized box (neon corners)
-      drawDetectionBox(ctx, x, y, w, h);
+    const w = maxX - minX;
+    const h = maxY - minY;
+    const padding = 20;
 
-      // Label with confidence
-      ctx.fillStyle = '#00ff88';
-      ctx.font = 'bold 14px Inter';
-      ctx.fillText(`Scanner (${(confidence * 100).toFixed(0)}%)`, x, y - 10);
-
-      // Targeted Decoding
-      const code = await decodeROI(det);
-      if (code) {
-        // Draw the code string with a background for readability
-        ctx.font = 'bold 18px Inter';
-        const textWidth = ctx.measureText(code).width;
-
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-        ctx.beginPath();
-        ctx.roundRect(x, y + h + 5, textWidth + 20, 30, 8);
-        ctx.fill();
-
-        ctx.fillStyle = '#ffffff';
-        ctx.fillText(code, x + 10, y + h + 27);
-
-        // Success feedback
-        handleSuccess(code);
-      }
-    }));
+    // Draw HUD Box
+    drawHUDBox(ctx, minX - padding, minY - padding, w + padding * 2, h + padding * 2);
   };
 
-  const drawDetectionBox = (ctx, x, y, w, h) => {
+  const drawHUDBox = (ctx, x, y, w, h) => {
     ctx.strokeStyle = '#00ff88';
     ctx.lineWidth = 3;
-
-    // Draw corners instead of a full rectangle for a premium feel
     const len = Math.min(w, h) * 0.2;
 
-    // Top Left
-    ctx.beginPath();
-    ctx.moveTo(x, y + len);
-    ctx.lineTo(x, y);
-    ctx.lineTo(x + len, y);
-    ctx.stroke();
+    // Corners
+    ctx.beginPath(); ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y + h - len); ctx.lineTo(x, y + h); ctx.lineTo(x + len, y + h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x + w - len, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - len); ctx.stroke();
 
-    // Top Right
-    ctx.beginPath();
-    ctx.moveTo(x + w - len, y);
-    ctx.lineTo(x + w, y);
-    ctx.lineTo(x + w, y + len);
-    ctx.stroke();
-
-    // Bottom Left
-    ctx.beginPath();
-    ctx.moveTo(x, y + h - len);
-    ctx.lineTo(x, y + h);
-    ctx.lineTo(x + len, y + h);
-    ctx.stroke();
-
-    // Bottom Right
-    ctx.beginPath();
-    ctx.moveTo(x + w - len, y + h);
-    ctx.lineTo(x + w, y + h);
-    ctx.lineTo(x + w, y + h - len);
-    ctx.stroke();
-
-    // Semi-transparent center fill
     ctx.fillStyle = 'rgba(0, 255, 136, 0.1)';
     ctx.fillRect(x, y, w, h);
   };
 
-  const decodeROI = async (det) => {
-    const { box } = det;
-    const [x, y, w, h] = box;
-    const video = videoRef.current;
-    if (!video) return null;
-
-    // Buffer region slightly for better decoding
-    const padding = 30;
-    const bx = Math.max(0, x - padding);
-    const by = Math.max(0, y - padding);
-    const bw = Math.min(video.videoWidth - bx, w + padding * 2);
-    const bh = Math.min(video.videoHeight - by, h + padding * 2);
-
-    const roiCanvas = document.createElement('canvas');
-    roiCanvas.width = bw;
-    roiCanvas.height = bh;
-    const roiCtx = roiCanvas.getContext('2d');
-    roiCtx.drawImage(video, bx, by, bw, bh, 0, 0, bw, bh);
-
-    try {
-      const result = await zxingReader.current.decodeFromCanvas(roiCanvas);
-      return result ? result.getText() : null;
-    } catch (e) {
-      return null;
-    }
-  };
-
   const handleSuccess = (code) => {
-    // Prevent duplicates (3 second cooldown)
     const now = Date.now();
-    if (code === lastScannedCode.current.code && (now - lastScannedCode.current.time < 3000)) {
-      return;
-    }
+    if (code === lastScannedCode.current.code && (now - lastScannedCode.current.time < 3000)) return;
 
     lastScannedCode.current = { code, time: now };
     setResults(prev => [{ code, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 5));
 
-    // UI Feedback Flash
+    // Feedback
     const appContainer = document.querySelector('.scanner-container');
     if (appContainer) {
       appContainer.classList.add('scan-success');
       setTimeout(() => appContainer.classList.remove('scan-success'), 200);
     }
-
-    // Haptic Feedback
     if (navigator.vibrate) navigator.vibrate(50);
 
-    // Visual Feedback
     confetti({
-      particleCount: 40,
-      spread: 70,
-      origin: { y: 0.6 },
-      colors: ['#00ff88', '#ffffff']
+      particleCount: 40, spread: 70, origin: { y: 0.6 }, colors: ['#00ff88', '#ffffff']
     });
   };
 
