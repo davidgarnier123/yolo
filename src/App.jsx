@@ -126,31 +126,88 @@ function App() {
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    for (const det of detections) {
+    // Process all detections in parallel for speed
+    await Promise.all(detections.map(async (det) => {
       const { box, confidence } = det;
       const [x, y, w, h] = box;
 
-      // Draw detection box
-      ctx.strokeStyle = '#00ff88';
-      ctx.lineWidth = 4;
-      ctx.strokeRect(x, y, w, h);
+      // Draw stylized box (neon corners)
+      drawDetectionBox(ctx, x, y, w, h);
 
-      // Draw label
+      // Label with confidence
       ctx.fillStyle = '#00ff88';
-      ctx.font = 'bold 16px Inter';
-      ctx.fillText(`${(confidence * 100).toFixed(0)}%`, x, y - 10);
+      ctx.font = 'bold 14px Inter';
+      ctx.fillText(`Scanner (${(confidence * 100).toFixed(0)}%)`, x, y - 10);
 
-      // Targeted Decoding with ZXing
-      await decodeROI(x, y, w, h);
-    }
+      // Targeted Decoding
+      const code = await decodeROI(det);
+      if (code) {
+        // Draw the code string with a background for readability
+        ctx.font = 'bold 18px Inter';
+        const textWidth = ctx.measureText(code).width;
+
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.beginPath();
+        ctx.roundRect(x, y + h + 5, textWidth + 20, 30, 8);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(code, x + 10, y + h + 27);
+
+        // Success feedback
+        handleSuccess(code);
+      }
+    }));
   };
 
-  const decodeROI = async (x, y, w, h) => {
-    const video = videoRef.current;
-    if (!video) return;
+  const drawDetectionBox = (ctx, x, y, w, h) => {
+    ctx.strokeStyle = '#00ff88';
+    ctx.lineWidth = 3;
 
-    // Buffer region slightly
-    const padding = 20;
+    // Draw corners instead of a full rectangle for a premium feel
+    const len = Math.min(w, h) * 0.2;
+
+    // Top Left
+    ctx.beginPath();
+    ctx.moveTo(x, y + len);
+    ctx.lineTo(x, y);
+    ctx.lineTo(x + len, y);
+    ctx.stroke();
+
+    // Top Right
+    ctx.beginPath();
+    ctx.moveTo(x + w - len, y);
+    ctx.lineTo(x + w, y);
+    ctx.lineTo(x + w, y + len);
+    ctx.stroke();
+
+    // Bottom Left
+    ctx.beginPath();
+    ctx.moveTo(x, y + h - len);
+    ctx.lineTo(x, y + h);
+    ctx.lineTo(x + len, y + h);
+    ctx.stroke();
+
+    // Bottom Right
+    ctx.beginPath();
+    ctx.moveTo(x + w - len, y + h);
+    ctx.lineTo(x + w, y + h);
+    ctx.lineTo(x + w, y + h - len);
+    ctx.stroke();
+
+    // Semi-transparent center fill
+    ctx.fillStyle = 'rgba(0, 255, 136, 0.1)';
+    ctx.fillRect(x, y, w, h);
+  };
+
+  const decodeROI = async (det) => {
+    const { box } = det;
+    const [x, y, w, h] = box;
+    const video = videoRef.current;
+    if (!video) return null;
+
+    // Buffer region slightly for better decoding
+    const padding = 30;
     const bx = Math.max(0, x - padding);
     const by = Math.max(0, y - padding);
     const bw = Math.min(video.videoWidth - bx, w + padding * 2);
@@ -163,28 +220,34 @@ function App() {
     roiCtx.drawImage(video, bx, by, bw, bh, 0, 0, bw, bh);
 
     try {
-      // Use ZXing to decode the small cropped image
       const result = await zxingReader.current.decodeFromCanvas(roiCanvas);
-      if (result) {
-        const code = result.getText();
-
-        // Prevent duplicates (3 second cooldown)
-        const now = Date.now();
-        if (code !== lastScannedCode.current.code || (now - lastScannedCode.current.time > 3000)) {
-          handleSuccess(code);
-        }
-      }
+      return result ? result.getText() : null;
     } catch (e) {
-      // No code found in this ROI, silent skip
+      return null;
     }
   };
 
   const handleSuccess = (code) => {
-    lastScannedCode.current = { code, time: Date.now() };
+    // Prevent duplicates (3 second cooldown)
+    const now = Date.now();
+    if (code === lastScannedCode.current.code && (now - lastScannedCode.current.time < 3000)) {
+      return;
+    }
+
+    lastScannedCode.current = { code, time: now };
     setResults(prev => [{ code, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 5));
 
-    // Feedback
+    // UI Feedback Flash
+    const appContainer = document.querySelector('.scanner-container');
+    if (appContainer) {
+      appContainer.classList.add('scan-success');
+      setTimeout(() => appContainer.classList.remove('scan-success'), 200);
+    }
+
+    // Haptic Feedback
     if (navigator.vibrate) navigator.vibrate(50);
+
+    // Visual Feedback
     confetti({
       particleCount: 40,
       spread: 70,
