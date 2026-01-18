@@ -1,80 +1,57 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { BrowserMultiFormatReader, BarcodeFormat } from '@zxing/library';
-import * as ort from 'onnxruntime-web';
-import { Camera, Zap, History, ShieldCheck, Settings, X, Check } from 'lucide-react';
+import { BarcodeDetectorPolyfill as BarcodeDetector } from '@undecaf/barcode-detector-polyfill';
+import { Camera, Zap, History, ShieldCheck, Settings, X, Check, Info } from 'lucide-react';
 import confetti from 'canvas-confetti';
-
-const YOLO_INPUT_SIZE = 640;
 
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const workerRef = useRef(null);
   const [results, setResults] = useState([]);
   const [status, setStatus] = useState('Initialisation...');
   const [isReady, setIsReady] = useState(false);
   const [devices, setDevices] = useState([]);
   const [currentDeviceId, setCurrentDeviceId] = useState('');
   const [showSettings, setShowSettings] = useState(false);
-  const [threshold, setThreshold] = useState(0.25);
+
   const [scanSpeed, setScanSpeed] = useState(150);
   const [logs, setLogs] = useState([{ msg: 'Initialisation du système...', type: 'info' }]);
   const [showPopup, setShowPopup] = useState(false);
+  const [engine, setEngine] = useState('Google'); // 'Google' or 'ZXing'
 
   const addLog = (msg, type = 'info') => {
     setLogs(prev => [{ msg, type, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 15));
   };
 
-  // ZXing Reader for localized decoding
+  // Readers
   const zxingReader = useRef(null);
+  const googleDetector = useRef(null);
   const lastScannedCode = useRef({ code: '', time: 0 });
 
   useEffect(() => {
     addLog('Démarrage de l\'application');
-    // Initialize ZXing with all common formats for broad compatibility
+
+    // 1. Setup Google (Barcode Detector API)
+    try {
+      googleDetector.current = new BarcodeDetector({
+        formats: ['code_128', 'qr_code', 'ean_13', 'code_39', 'itf', 'data_matrix']
+      });
+      addLog('Moteur Google Barcode API prêt', 'success');
+    } catch (e) {
+      addLog('Google Barcode API non supporté nativement, polyfill actif', 'info');
+    }
+
+    // 2. Setup ZXing Fallback
     const hints = new Map();
-    hints.set(2, [
-      BarcodeFormat.CODE_128,
-      BarcodeFormat.QR_CODE,
-      BarcodeFormat.EAN_13,
-      BarcodeFormat.CODE_39,
-      BarcodeFormat.ITF
-    ]);
+    hints.set(2, [BarcodeFormat.CODE_128, BarcodeFormat.QR_CODE, BarcodeFormat.EAN_13]);
     zxingReader.current = new BrowserMultiFormatReader(hints);
 
-    // Initialize Web Worker
-    const worker = new Worker(new URL('./yoloWorker.js', import.meta.url), { type: 'module' });
-    workerRef.current = worker;
-
-    worker.onmessage = (e) => {
-      const { type, payload } = e.data;
-      if (type === 'MODEL_LOADED') {
-        setStatus('Ready');
-        setIsReady(true);
-        addLog('Modèle YOLO chargé !', 'success');
-        startDetectionLoop();
-      } else if (type === 'INFERENCE_RESULT') {
-        handleDetections(payload);
-      } else if (type === 'LOG') {
-        addLog(payload.msg, payload.type);
-      } else if (type === 'ERROR') {
-        setStatus(`Error`);
-        addLog(`ERREUR WORKER: ${payload.msg || payload}`, 'error');
-      }
-    };
-
-    // Load Model with absolute URL
-    worker.postMessage({
-      type: 'LOAD_MODEL',
-      payload: {
-        modelUrl: window.location.origin + '/models/yolov8n-barcode.onnx'
-      }
-    });
-
+    setStatus('Ready');
+    setIsReady(true);
+    startDetectionLoop();
     setupCamera();
 
     return () => {
-      workerRef.current?.terminate();
       if (videoRef.current?.srcObject) {
         videoRef.current.srcObject.getTracks().forEach(track => track.stop());
       }
@@ -94,12 +71,12 @@ function App() {
           facingMode: deviceId ? undefined : 'environment',
           width: { ideal: 1280 },
           height: { ideal: 720 },
-          focusMode: 'continuous' // Try to force autofocus
+          focusMode: 'continuous'
         }
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      addLog('Caméra OK');
+      addLog('Caméra activée');
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -107,14 +84,14 @@ function App() {
         if (currentTrack) {
           const settings = currentTrack.getSettings();
           setCurrentDeviceId(settings.deviceId);
-          addLog(`Résolution: ${settings.width}x${settings.height}`);
+          addLog(`${settings.width}x${settings.height} @ ${Math.round(settings.frameRate || 30)}fps`);
         }
       }
     } catch (err) {
       if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        addLog('ACCÈS CAMÉRA REFUSÉ ! Veuillez autoriser la caméra dans les réglages de votre navigateur.', 'error');
+        addLog('ACCÈS CAMÉRA REFUSÉ !', 'error');
       } else {
-        addLog(`Erreur Caméra: ${err.message}`, 'error');
+        addLog(`Erreur: ${err.message}`, 'error');
       }
       setStatus('Err: ' + err.message);
     }
@@ -139,24 +116,28 @@ function App() {
 
       const video = videoRef.current;
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        const offscreenCanvas = document.createElement('canvas');
-        offscreenCanvas.width = YOLO_INPUT_SIZE;
-        offscreenCanvas.height = YOLO_INPUT_SIZE;
-        const ctx = offscreenCanvas.getContext('2d');
-        ctx.drawImage(video, 0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
-
-        const imageData = ctx.getImageData(0, 0, YOLO_INPUT_SIZE, YOLO_INPUT_SIZE);
-        const floatData = imageDataToTensor(imageData);
-
-        workerRef.current.postMessage({
-          type: 'FRAME',
-          payload: {
-            floatData,
-            originalWidth: video.videoWidth,
-            originalHeight: video.videoHeight,
-            threshold // Dynamic threshold
+        try {
+          if (engine === 'Google') {
+            const barcodes = await googleDetector.current.detect(video);
+            if (barcodes.length > 0) {
+              drawOverlay(barcodes);
+              barcodes.forEach(b => handleSuccess(b.rawValue));
+            } else {
+              // Optionnel: fallback ZXing sur frame entière si Google ne voit rien
+              // tryZXingFallback();
+            }
+          } else {
+            // ZXing direct mode
+            try {
+              const result = await zxingReader.current.decodeFromVideoElement(video);
+              if (result) handleSuccess(result.getText());
+            } catch (e) {
+              // No barcode found
+            }
           }
-        });
+        } catch (err) {
+          // Detection error
+        }
       }
       setTimeout(() => { if (isReady) frameId = requestAnimationFrame(processFrame); }, scanSpeed);
     };
@@ -164,94 +145,35 @@ function App() {
     return () => cancelAnimationFrame(frameId);
   };
 
-  const imageDataToTensor = (imageData) => {
-    const { data } = imageData;
-    const [red, green, blue] = [
-      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE),
-      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE),
-      new Float32Array(YOLO_INPUT_SIZE * YOLO_INPUT_SIZE)
-    ];
-
-    for (let i = 0; i < data.length; i += 4) {
-      red[i / 4] = data[i] / 255.0;
-      green[i / 4] = data[i + 1] / 255.0;
-      blue[i / 4] = data[i + 2] / 255.0;
-    }
-
-    const inputData = new Float32Array(3 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
-    inputData.set(red, 0);
-    inputData.set(green, YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
-    inputData.set(blue, 2 * YOLO_INPUT_SIZE * YOLO_INPUT_SIZE);
-
-    return inputData;
-  };
-
-  const handleDetections = async (payload) => {
-    const { detections, width, height } = payload;
+  const drawOverlay = (barcodes) => {
     const canvas = canvasRef.current;
-    if (!canvas || !videoRef.current) return;
+    const video = videoRef.current;
+    if (!canvas || !video) return;
 
-    canvas.width = width;
-    canvas.height = height;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    if (detections.length > 0) {
-      addLog(`IA: ${detections.length} objet(s) trouvé(s)`, 'info');
-    }
+    barcodes.forEach(barcode => {
+      const { x, y, width, height } = barcode.boundingBox;
 
-    for (const det of detections) {
-      const { x, y, w, h, confidence } = det;
-      drawDetectionBox(ctx, x, y, w, h);
+      // Box
+      ctx.strokeStyle = '#00ff88';
+      ctx.lineWidth = 6;
+      ctx.strokeRect(x, y, width, height);
 
+      // Label
       ctx.fillStyle = '#00ff88';
       ctx.font = 'bold 24px Inter';
-      ctx.fillText(`${(confidence * 100).toFixed(0)}%`, x, y - 15);
+      ctx.fillText(barcode.format, x, y - 10);
 
-      const code = await decodeROI(det);
-      if (code) {
-        handleSuccess(code, det);
-      }
-    }
-  };
-
-  const drawDetectionBox = (ctx, x, y, w, h) => {
-    ctx.strokeStyle = '#00ff88';
-    ctx.lineWidth = 6;
-    const len = Math.min(w, h) * 0.3;
-
-    ctx.beginPath(); ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(x, y + h - len); ctx.lineTo(x, y + h); ctx.lineTo(x + len, y + h); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(x + w - len, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - len); ctx.stroke();
-
-    ctx.fillStyle = 'rgba(0, 255, 136, 0.2)';
-    ctx.fillRect(x, y, w, h);
-  };
-
-  const decodeROI = async (det) => {
-    const { x, y, w, h } = det;
-    const video = videoRef.current;
-    if (!video) return null;
-
-    const padding = 50;
-    const bx = Math.max(0, x - padding);
-    const by = Math.max(0, y - padding);
-    const bw = Math.min(video.videoWidth - bx, w + padding * 2);
-    const bh = Math.min(video.videoHeight - by, h + padding * 2);
-
-    const roiCanvas = document.createElement('canvas');
-    roiCanvas.width = bw;
-    roiCanvas.height = bh;
-    const roiCtx = roiCanvas.getContext('2d');
-    roiCtx.drawImage(video, bx, by, bw, bh, 0, 0, bw, bh);
-
-    try {
-      const result = await zxingReader.current.decodeFromCanvas(roiCanvas);
-      return result ? result.getText() : null;
-    } catch (e) {
-      return null;
-    }
+      // Glowing effect
+      ctx.shadowBlur = 15;
+      ctx.shadowColor = '#00ff88';
+      ctx.strokeRect(x, y, width, height);
+      ctx.shadowBlur = 0;
+    });
   };
 
   const handleSuccess = (code) => {
@@ -261,7 +183,7 @@ function App() {
     lastScannedCode.current = { code, time: now };
     setResults(prev => [{ code, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 5));
 
-    addLog(`SUCCÈS : ${code}`, 'success');
+    addLog(`DÉTECTÉ (${engine}): ${code}`, 'success');
     setShowPopup(true);
     setTimeout(() => setShowPopup(false), 800);
 
@@ -277,7 +199,7 @@ function App() {
   return (
     <div className="scanner-container">
       <div className={`detection-popup ${showPopup ? 'active' : ''}`}>
-        SUCCESS!
+        CODE {results[0]?.code.slice(0, 8)}...
       </div>
 
       <div className="video-container">
@@ -288,7 +210,7 @@ function App() {
 
       <div className="ui-layer">
         <header className="header">
-          <h1>HYPER SCAN PRO</h1>
+          <h1>GOOGLE ML ENGINE</h1>
           <button className="icon-button" onClick={() => setShowSettings(true)}>
             <Settings size={24} color="#fff" />
           </button>
@@ -315,46 +237,44 @@ function App() {
           <div className="settings-drawer-overlay" onClick={() => setShowSettings(false)}>
             <div className="settings-drawer" onClick={e => e.stopPropagation()}>
               <div className="settings-header">
-                <h2>Tuning & Options</h2>
+                <h2>Configuration Engine</h2>
                 <button className="icon-button" onClick={() => setShowSettings(false)}>
                   <X size={24} color="#fff" />
                 </button>
               </div>
               <div className="settings-content">
                 <section className="settings-section">
-                  <h3>Sensibilité (Inférence)</h3>
-                  <div className="control-group">
-                    <input
-                      type="range" min="0.05" max="0.8" step="0.05"
-                      value={threshold}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value);
-                        setThreshold(val);
-                        addLog(`Seuil réglé à ${val}`);
-                      }}
-                    />
-                    <span className="control-value">{(threshold * 100).toFixed(0)}%</span>
+                  <h3>Moteur de Scan</h3>
+                  <div className="engine-toggle">
+                    <button
+                      className={`engine-btn ${engine === 'Google' ? 'active' : ''}`}
+                      onClick={() => { setEngine('Google'); addLog('Moteur commuté sur Google'); }}
+                    >
+                      Google (ML Kit)
+                    </button>
+                    <button
+                      className={`engine-btn ${engine === 'ZXing' ? 'active' : ''}`}
+                      onClick={() => { setEngine('ZXing'); addLog('Moteur commuté sur ZXing'); }}
+                    >
+                      ZXing (Classic)
+                    </button>
                   </div>
                 </section>
 
                 <section className="settings-section">
-                  <h3>Vitesse du scan</h3>
+                  <h3>Fréquence (Délai)</h3>
                   <div className="control-group">
                     <input
-                      type="range" min="50" max="500" step="50"
+                      type="range" min="50" max="1000" step="50"
                       value={scanSpeed}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value);
-                        setScanSpeed(val);
-                        addLog(`FPS limit: ${Math.round(1000 / val)}/s`);
-                      }}
+                      onChange={(e) => setScanSpeed(parseInt(e.target.value))}
                     />
                     <span className="control-value">{scanSpeed}ms</span>
                   </div>
                 </section>
 
                 <section className="settings-section">
-                  <h3>Select Camera</h3>
+                  <h3>Choix Caméra</h3>
                   <div className="device-list">
                     {devices.map(device => (
                       <button
@@ -377,9 +297,9 @@ function App() {
         <footer className="footer">
           <div className="status-badge">
             <div className={`status-dot ${status === 'Ready' ? '' : 'error'}`} />
-            {status}
+            {engine} Mode
           </div>
-          <History size={24} color="#aaa" />
+          <Info size={24} color="#aaa" />
         </footer>
       </div>
     </div>

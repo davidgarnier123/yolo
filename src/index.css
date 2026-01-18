@@ -336,6 +336,65 @@ body {
   animation: flash 0.2s ease-out forwards;
 }
 
+.engine-toggle {
+  display: flex;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 5px;
+  border-radius: 12px;
+}
+
+.engine-btn {
+  flex: 1;
+  padding: 10px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: #888;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.engine-btn.active {
+  background: var(--primary);
+  color: #000;
+  box-shadow: 0 4px 12px rgba(0, 255, 136, 0.3);
+}
+
+.scanner-container.scan-success::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 255, 136, 0.2);
+  pointer-events: none;
+  animation: flash 0.2s ease-out;
+}
+
+@keyframes flash {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 480px) {
+  .header h1 {
+    font-size: 1.2rem;
+  }
+
+  .result-card {
+    padding: 0.8rem;
+  }
+
+  .debug-console {
+    height: 80px;
+  }
+}
+
 /* Settings Drawer */
 .settings-drawer-overlay {
   position: fixed;
