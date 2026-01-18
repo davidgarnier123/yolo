@@ -10,13 +10,8 @@ function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const workerRef = useRef(null);
-  const [results, setResults] = useState([]);
-  const [status, setStatus] = useState('Initialisation...');
-  const [isReady, setIsReady] = useState(false);
-  const [devices, setDevices] = useState([]);
-  const [currentDeviceId, setCurrentDeviceId] = useState('');
-  const [showSettings, setShowSettings] = useState(false);
-
+  const [threshold, setThreshold] = useState(0.25);
+  const [scanSpeed, setScanSpeed] = useState(150); // ms between frames
   const [logs, setLogs] = useState([{ msg: 'Initialisation du système...', type: 'info' }]);
   const [showPopup, setShowPopup] = useState(false);
 
@@ -24,16 +19,19 @@ function App() {
     setLogs(prev => [{ msg, type, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 15));
   };
 
-  // ZXing Reader for localized decoding
-  const zxingReader = useRef(null);
-  const lastScannedCode = useRef({ code: '', time: 0 });
-
   useEffect(() => {
     addLog('Démarrage de l\'application');
-    // Initialize ZXing with Code 128 priority
+    // Initialize ZXing with all common formats for broad compatibility
     const hints = new Map();
-    hints.set(2, [BarcodeFormat.CODE_128, BarcodeFormat.QR_CODE]); // 2 is DecodeHintType.POSSIBLE_FORMATS
+    hints.set(2, [
+      BarcodeFormat.CODE_128,
+      BarcodeFormat.QR_CODE,
+      BarcodeFormat.EAN_13,
+      BarcodeFormat.CODE_39,
+      BarcodeFormat.ITF
+    ]);
     zxingReader.current = new BrowserMultiFormatReader(hints);
+
     // Initialize Web Worker
     const worker = new Worker(new URL('./yoloWorker.js', import.meta.url), { type: 'module' });
     workerRef.current = worker;
@@ -43,20 +41,24 @@ function App() {
       if (type === 'MODEL_LOADED') {
         setStatus('Ready');
         setIsReady(true);
-        addLog('Modèle YOLO chargé avec succès !', 'success');
+        addLog('Modèle YOLO chargé !', 'success');
         startDetectionLoop();
       } else if (type === 'INFERENCE_RESULT') {
         handleDetections(payload);
+      } else if (type === 'LOG') {
+        addLog(payload.msg, payload.type);
       } else if (type === 'ERROR') {
-        setStatus(`Error: ${payload}`);
-        addLog(`ERREUR: ${payload}`, 'error');
+        setStatus(`Error`);
+        addLog(`ERREUR WORKER: ${payload.msg || payload}`, 'error');
       }
     };
 
-    // Load Model
+    // Load Model with absolute URL
     worker.postMessage({
       type: 'LOAD_MODEL',
-      payload: { modelUrl: window.location.origin + '/models/yolov8n-barcode.onnx' }
+      payload: {
+        modelUrl: window.location.origin + '/models/yolov8n-barcode.onnx'
+      }
     });
 
     setupCamera();
@@ -81,30 +83,31 @@ function App() {
           deviceId: deviceId ? { exact: deviceId } : undefined,
           facingMode: deviceId ? undefined : 'environment',
           width: { ideal: 1280 },
-          height: { ideal: 720 }
+          height: { ideal: 720 },
+          focusMode: 'continuous' // Try to force autofocus
         }
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      addLog('Flux caméra activé');
+      addLog('Caméra OK');
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         const currentTrack = stream.getVideoTracks()[0];
         if (currentTrack) {
           const settings = currentTrack.getSettings();
           setCurrentDeviceId(settings.deviceId);
+          addLog(`Résolution: ${settings.width}x${settings.height}`);
         }
       }
-      const updatedDevices = await navigator.mediaDevices.enumerateDevices();
-      setDevices(updatedDevices.filter(d => d.kind === 'videoinput'));
     } catch (err) {
       addLog(`Erreur Caméra: ${err.message}`, 'error');
-      setStatus('Camera Error: ' + err.message);
+      setStatus('Err: ' + err.message);
     }
   };
 
   const handleDeviceChange = (newDeviceId) => {
-    addLog('Changement de caméra...');
+    addLog('Switch Caméra...');
     if (videoRef.current?.srcObject) {
       videoRef.current.srcObject.getTracks().forEach(track => track.stop());
     }
@@ -113,10 +116,10 @@ function App() {
   };
 
   const startDetectionLoop = () => {
-    addLog('Boucle de détection lancée à 7 FPS');
+    let frameId;
     const processFrame = async () => {
       if (!videoRef.current || !isReady) {
-        requestAnimationFrame(processFrame);
+        frameId = requestAnimationFrame(processFrame);
         return;
       }
 
@@ -136,14 +139,15 @@ function App() {
           payload: {
             tensor,
             originalWidth: video.videoWidth,
-            originalHeight: video.videoHeight
+            originalHeight: video.videoHeight,
+            threshold // Dynamic threshold
           }
         });
       }
-      // Speed check for iOS battery (can be adjusted)
-      setTimeout(() => requestAnimationFrame(processFrame), 140);
+      setTimeout(() => { if (isReady) frameId = requestAnimationFrame(processFrame); }, scanSpeed);
     };
     processFrame();
+    return () => cancelAnimationFrame(frameId);
   };
 
   const imageDataToTensor = (imageData) => {
@@ -169,42 +173,39 @@ function App() {
   };
 
   const handleDetections = async (payload) => {
-    const { detections, originalWidth, originalHeight } = payload;
+    const { detections, width, height } = payload;
     const canvas = canvasRef.current;
     if (!canvas || !videoRef.current) return;
 
-    if (detections.length > 0) {
-      // Optionnel: addLog(`Cible détectée (${detections.length})`, 'info');
-    }
-
-    canvas.width = originalWidth;
-    canvas.height = originalHeight;
+    canvas.width = width;
+    canvas.height = height;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    await Promise.all(detections.map(async (det) => {
-      const { x, y, w, h, confidence } = det;
+    if (detections.length > 0) {
+      addLog(`IA: ${detections.length} objet(s) trouvé(s)`, 'info');
+    }
 
-      // Visual feedback
+    for (const det of detections) {
+      const { x, y, w, h, confidence } = det;
       drawDetectionBox(ctx, x, y, w, h);
+
       ctx.fillStyle = '#00ff88';
       ctx.font = 'bold 24px Inter';
       ctx.fillText(`${(confidence * 100).toFixed(0)}%`, x, y - 15);
 
-      // Localized Decoding
       const code = await decodeROI(det);
       if (code) {
-        handleSuccess(code, { x, y, w, h });
+        handleSuccess(code, det);
       }
-    }));
+    }
   };
 
   const drawDetectionBox = (ctx, x, y, w, h) => {
     ctx.strokeStyle = '#00ff88';
-    ctx.lineWidth = 6; // Plus épais
+    ctx.lineWidth = 6;
     const len = Math.min(w, h) * 0.3;
 
-    // Stylish corners
     ctx.beginPath(); ctx.moveTo(x, y + len); ctx.lineTo(x, y); ctx.lineTo(x + len, y); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x + w - len, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + len); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(x, y + h - len); ctx.lineTo(x, y + h); ctx.lineTo(x + len, y + h); ctx.stroke();
@@ -219,7 +220,7 @@ function App() {
     const video = videoRef.current;
     if (!video) return null;
 
-    const padding = 40; // Plus de padding pour ZXing
+    const padding = 50;
     const bx = Math.max(0, x - padding);
     const by = Math.max(0, y - padding);
     const bw = Math.min(video.videoWidth - bx, w + padding * 2);
@@ -239,18 +240,17 @@ function App() {
     }
   };
 
-  const handleSuccess = (code, box) => {
+  const handleSuccess = (code) => {
     const now = Date.now();
     if (code === lastScannedCode.current.code && (now - lastScannedCode.current.time < 3000)) return;
 
     lastScannedCode.current = { code, time: now };
     setResults(prev => [{ code, time: new Date().toLocaleTimeString() }, ...prev].slice(0, 5));
 
-    addLog(`DÉCODÉ : ${code}`, 'success');
+    addLog(`SUCCÈS : ${code}`, 'success');
     setShowPopup(true);
     setTimeout(() => setShowPopup(false), 800);
 
-    // Feedback
     const appContainer = document.querySelector('.scanner-container');
     if (appContainer) {
       appContainer.classList.add('scan-success');
@@ -263,7 +263,7 @@ function App() {
   return (
     <div className="scanner-container">
       <div className={`detection-popup ${showPopup ? 'active' : ''}`}>
-        DETECTED!
+        SUCCESS!
       </div>
 
       <div className="video-container">
@@ -301,12 +301,44 @@ function App() {
           <div className="settings-drawer-overlay" onClick={() => setShowSettings(false)}>
             <div className="settings-drawer" onClick={e => e.stopPropagation()}>
               <div className="settings-header">
-                <h2>Settings</h2>
+                <h2>Tuning & Options</h2>
                 <button className="icon-button" onClick={() => setShowSettings(false)}>
                   <X size={24} color="#fff" />
                 </button>
               </div>
               <div className="settings-content">
+                <section className="settings-section">
+                  <h3>Sensibilité (Inférence)</h3>
+                  <div className="control-group">
+                    <input
+                      type="range" min="0.05" max="0.8" step="0.05"
+                      value={threshold}
+                      onChange={(e) => {
+                        const val = parseFloat(e.target.value);
+                        setThreshold(val);
+                        addLog(`Seuil réglé à ${val}`);
+                      }}
+                    />
+                    <span className="control-value">{(threshold * 100).toFixed(0)}%</span>
+                  </div>
+                </section>
+
+                <section className="settings-section">
+                  <h3>Vitesse du scan</h3>
+                  <div className="control-group">
+                    <input
+                      type="range" min="50" max="500" step="50"
+                      value={scanSpeed}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value);
+                        setScanSpeed(val);
+                        addLog(`FPS limit: ${Math.round(1000 / val)}/s`);
+                      }}
+                    />
+                    <span className="control-value">{scanSpeed}ms</span>
+                  </div>
+                </section>
+
                 <section className="settings-section">
                   <h3>Select Camera</h3>
                   <div className="device-list">
@@ -317,16 +349,11 @@ function App() {
                         onClick={() => handleDeviceChange(device.deviceId)}
                       >
                         <Camera size={18} />
-                        <span className="device-label">{device.label || `Camera ${device.deviceId.slice(0, 5)}...`}</span>
+                        <span className="device-label">{device.label || `Cam ${device.deviceId.slice(0, 5)}`}</span>
                         {currentDeviceId === device.deviceId && <Check size={18} color="#00ff88" />}
                       </button>
                     ))}
                   </div>
-                </section>
-                <section className="settings-section">
-                  <h3>Engine</h3>
-                  <p className="version-text">Hybrid YOLOv8 + ZXing Engine</p>
-                  <p className="version-text">Version 2.0.0 (Robust iOS)</p>
                 </section>
               </div>
             </div>
@@ -338,10 +365,7 @@ function App() {
             <div className={`status-dot ${status === 'Ready' ? '' : 'error'}`} />
             {status}
           </div>
-          <div style={{ display: 'flex', gap: '1rem' }}>
-            <History size={24} color="#aaa" />
-            <ShieldCheck size={24} color="#aaa" />
-          </div>
+          <History size={24} color="#aaa" />
         </footer>
       </div>
     </div>

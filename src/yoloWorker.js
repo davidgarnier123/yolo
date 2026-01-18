@@ -1,49 +1,61 @@
 import * as ort from 'onnxruntime-web';
 
-// Config ONNX for Browser/Vercel
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/';
-
-let session = null;
+// Configuration
 const YOLO_INPUT_SIZE = 640;
-const CONFIDENCE_THRESHOLD = 0.3;
+let session = null;
 
-self.onmessage = async function (e) {
+// Helper for logging back to main thread
+function log(msg, type = 'info') {
+    self.postMessage({ type: 'LOG', payload: { msg, type } });
+}
+
+self.onmessage = async (e) => {
     const { type, payload } = e.data;
 
     if (type === 'LOAD_MODEL') {
         try {
+            log('Chargement du moteur ONNX...');
+            ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+
             session = await ort.InferenceSession.create(payload.modelUrl, {
-                executionProviders: ['wasm', 'webgl'],
+                executionProviders: ['wasm'],
                 graphOptimizationLevel: 'all'
             });
+
+            log('Moteur prêt (WASM)', 'success');
             self.postMessage({ type: 'MODEL_LOADED' });
         } catch (err) {
-            self.postMessage({ type: 'ERROR', payload: `Inference Error: ${err.message}` });
+            self.postMessage({ type: 'ERROR', payload: err.message });
         }
-    } else if (type === 'FRAME') {
-        const { tensor, originalWidth, originalHeight } = payload;
-        if (!session) return;
+    }
 
+    if (type === 'FRAME') {
+        if (!session) return;
         try {
-            // Inférence
-            const outputs = await session.run({ images: tensor }); // YOLO standard name is 'images'
-            const detections = processYOLOv8Output(outputs, originalWidth, originalHeight);
+            const { tensor, originalWidth, originalHeight, threshold = 0.25 } = payload;
+            const feeds = { [session.inputNames[0]]: tensor };
+            const results = await session.run(feeds);
+
+            const detections = processYOLOv8Output(results, originalWidth, originalHeight, threshold);
 
             self.postMessage({
                 type: 'INFERENCE_RESULT',
-                payload: { detections, originalWidth, originalHeight }
+                payload: {
+                    detections,
+                    width: originalWidth,
+                    height: originalHeight
+                }
             });
         } catch (err) {
-            self.postMessage({ type: 'ERROR', payload: `Inference Failed: ${err.message}` });
+            log(`Inference Error: ${err.message}`, 'error');
         }
     }
 };
 
-function processYOLOv8Output(outputsObj, width, height) {
-    // Adaptation au format YOLOv8 (typiquement [1, 84, 8400])
+function processYOLOv8Output(outputsObj, width, height, threshold) {
     const output = outputsObj[Object.keys(outputsObj)[0]];
     const data = output.data;
-    const dims = output.dims; // [1, 5, 8400] (x, y, w, h, score) ou [1, 84, 8400]
+    const dims = output.dims; // [1, 5, 8400]
 
     let numDetections, numFeatures, isTransposed;
     if (dims[1] > dims[2]) {
@@ -57,6 +69,7 @@ function processYOLOv8Output(outputsObj, width, height) {
     }
 
     const detections = [];
+    // YOLOv8n-barcode usually has 1 class
     const numClasses = numFeatures - 4;
 
     for (let i = 0; i < numDetections; i++) {
@@ -68,13 +81,12 @@ function processYOLOv8Output(outputsObj, width, height) {
             if (score > maxScore) maxScore = score;
         }
 
-        if (maxScore > CONFIDENCE_THRESHOLD) {
+        if (maxScore > threshold) {
             const x_center = isTransposed ? data[i * numFeatures + 0] : data[numDetections * 0 + i];
             const y_center = isTransposed ? data[i * numFeatures + 1] : data[numDetections * 1 + i];
             const w = isTransposed ? data[i * numFeatures + 2] : data[numDetections * 2 + i];
             const h = isTransposed ? data[i * numFeatures + 3] : data[numDetections * 3 + i];
 
-            // Conversion vers les coordonnées de l'image originale
             detections.push({
                 x: (x_center - w / 2) * (width / YOLO_INPUT_SIZE),
                 y: (y_center - h / 2) * (height / YOLO_INPUT_SIZE),
@@ -109,8 +121,14 @@ function iou(boxA, boxB) {
     const yA = Math.max(boxA.y, boxB.y);
     const xB = Math.min(boxA.x + boxA.w, boxB.x + boxB.w);
     const yB = Math.min(boxA.y + boxA.h, boxB.y + boxB.h);
-    const interArea = Math.max(0, xB - xA) * Math.max(0, yB - yA);
-    const boxAArea = boxA.w * boxA.h;
-    const boxBArea = boxB.w * boxB.h;
-    return interArea / (boxAArea + boxBArea - interArea);
+
+    const interWidth = Math.max(0, xB - xA);
+    const interHeight = Math.max(0, yB - yA);
+    const interArea = interWidth * interHeight;
+
+    const areaA = boxA.w * boxA.h;
+    const areaB = boxB.w * boxB.h;
+    const unionArea = areaA + areaB - interArea;
+
+    return interArea / unionArea;
 }
